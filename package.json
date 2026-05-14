@@ -1,0 +1,14 @@
+{
+  "name": "fishgame-backend",
+  "version": "0.1.0",
+  "description": "Backend service extracted from wakaka-sam/fishing-game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

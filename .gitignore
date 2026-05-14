@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+.env
+data/users/
+data/codes.json
+data/rewards.json
+coverage/
