@@ -158,3 +158,22 @@ test('leaderboard reports daily and total stats', async (t) => {
   assert.equal(ranker.totalCatches, 9);
   assert.equal(ranker.totalWeight, 45.68);
 });
+
+test('ops db-info reports storage metadata', async (t) => {
+  const server = createServer();
+  t.after(() => server.close());
+  const base = await listen(server);
+
+  await request(base, '/api/login', {
+    method: 'POST',
+    body: JSON.stringify({ username: 'OpsUser' }),
+  });
+
+  const { res, body } = await request(base, '/api/admin/db-info');
+
+  assert.equal(res.status, 200);
+  assert.equal(body.storageDriver, 'file');
+  assert.equal(body.connection.mode, 'local files');
+  assert.ok(body.summary.userCount >= 1);
+  assert.ok(body.tables.some((table) => table.name === 'users/*.json'));
+});

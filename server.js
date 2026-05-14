@@ -6,34 +6,36 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
+const OPS_PUBLIC = path.join(ROOT, 'ops_public');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const USERS_DIR = path.join(DATA_DIR, 'users');
 
-if (!fs.existsSync(USERS_DIR)) fs.mkdirSync(USERS_DIR, { recursive: true });
-
 const CODES_FILE = path.join(DATA_DIR, 'codes.json');
 const REWARDS_FILE = path.join(DATA_DIR, 'rewards.json');
+const STORAGE_DRIVER = process.env.STORAGE_DRIVER || (process.env.MYSQL_URL ? 'mysql' : 'file');
 
 function bjNow() { return new Date(Date.now() + 8 * 3600000); }
 function bjDateStr(d) { return d.toISOString().slice(0, 10); }
 function bjMinutes(d) { return d.getUTCHours() * 60 + d.getUTCMinutes(); }
 
-function loadRewards() {
-  if (fs.existsSync(REWARDS_FILE)) return JSON.parse(fs.readFileSync(REWARDS_FILE, 'utf8'));
-  return { lastSettleDate: '', history: [] };
+async function loadRewards() {
+  await store.init();
+  return (await store.getRewards()) || { lastSettleDate: '', history: [] };
 }
-function saveRewards(r) { fs.writeFileSync(REWARDS_FILE, JSON.stringify(r, null, 2)); }
+async function saveRewards(r) {
+  await store.init();
+  await store.saveRewards(r);
+}
 
-function settleRankReward(settleDate = bjDateStr(bjNow())) {
-  const rewards = loadRewards();
+async function settleRankReward(settleDate = bjDateStr(bjNow())) {
+  const rewards = await loadRewards();
   if (rewards.lastSettleDate >= settleDate) return;
 
-  const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
   let topUser = null;
   let topCatches = 0;
-  for (const f of files) {
+  const users = await store.listUsers();
+  for (const u of users) {
     try {
-      const u = JSON.parse(fs.readFileSync(path.join(USERS_DIR, f), 'utf8'));
       const daily = (u.dailyStats && u.dailyStats.date === settleDate) ? u.dailyStats : null;
       if (daily && (daily.catches || 0) > topCatches) {
         topCatches = daily.catches;
@@ -43,17 +45,17 @@ function settleRankReward(settleDate = bjDateStr(bjNow())) {
   }
 
   if (topUser && topCatches > 0) {
-    const u = loadUser(topUser);
+    const u = await loadUser(topUser);
     u.diamonds = (u.diamonds || 0) + 5000;
     if (!u.rankRewards) u.rankRewards = [];
     u.rankRewards.push({ date: settleDate, catches: topCatches, diamonds: 5000, seen: false });
-    saveUser(u);
+    await saveUser(u);
     rewards.history.unshift({ date: settleDate, username: topUser, catches: topCatches, diamonds: 5000 });
     if (rewards.history.length > 30) rewards.history = rewards.history.slice(0, 30);
     console.log(`[排名奖励] ${settleDate} 钓鱼数第一名: ${topUser} (${topCatches}次) 获得5000钻石`);
   }
   rewards.lastSettleDate = settleDate;
-  saveRewards(rewards);
+  await saveRewards(rewards);
 }
 
 function scheduleSettlement() {
@@ -63,14 +65,14 @@ function scheduleSettlement() {
   const ms = target.getTime() - Date.now();
   console.log(`[排名奖励] 下次结算时间: ${bjDateStr(target)} 23:59 北京时间 (${Math.round(ms/60000)}分钟后)`);
   setTimeout(() => {
-    settleRankReward(bjDateStr(bjNow()));
+    settleRankReward(bjDateStr(bjNow())).catch((e) => console.error('[排名奖励] 结算失败:', e));
     scheduleSettlement();
   }, ms);
 }
 
-function settleRankRewardIfDue() {
+async function settleRankRewardIfDue() {
   const now = bjNow();
-  if (bjMinutes(now) >= 23 * 60 + 59) settleRankReward(bjDateStr(now));
+  if (bjMinutes(now) >= 23 * 60 + 59) await settleRankReward(bjDateStr(now));
 }
 
 const DEFAULT_CODES = {
@@ -93,21 +95,271 @@ function createAccessory(type) {
   };
 }
 
-function loadCodes() {
-  let codes = {};
-  if (fs.existsSync(CODES_FILE)) {
-    codes = JSON.parse(fs.readFileSync(CODES_FILE, 'utf8'));
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function parseStoredJson(value) {
+  if (!value) return null;
+  return typeof value === 'string' ? JSON.parse(value) : value;
+}
+
+function maskConnectionUri(uri) {
+  if (!uri) return '';
+  try {
+    const parsed = new URL(uri);
+    if (parsed.password) parsed.password = '***';
+    return parsed.toString();
+  } catch (_) {
+    return uri.replace(/:\/\/([^:\s]+):([^@\s]+)@/, '://$1:***@');
   }
+}
+
+function quoteIdentifier(name) {
+  return '`' + String(name).replace(/`/g, '``') + '`';
+}
+
+function createFileStore() {
+  return {
+    async init() {
+      if (!fs.existsSync(USERS_DIR)) fs.mkdirSync(USERS_DIR, { recursive: true });
+    },
+    async getUser(name) {
+      const p = userPath(name);
+      return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
+    },
+    async saveUser(user) {
+      fs.writeFileSync(userPath(user.username), JSON.stringify(user, null, 2));
+    },
+    async listUsers() {
+      if (!fs.existsSync(USERS_DIR)) return [];
+      const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
+      return files.flatMap((f) => {
+        try {
+          return [JSON.parse(fs.readFileSync(path.join(USERS_DIR, f), 'utf8'))];
+        } catch (_) {
+          return [];
+        }
+      });
+    },
+    async getCodes() {
+      return fs.existsSync(CODES_FILE) ? JSON.parse(fs.readFileSync(CODES_FILE, 'utf8')) : {};
+    },
+    async saveCodes(codes) {
+      fs.writeFileSync(CODES_FILE, JSON.stringify(codes, null, 2));
+    },
+    async getRewards() {
+      return fs.existsSync(REWARDS_FILE) ? JSON.parse(fs.readFileSync(REWARDS_FILE, 'utf8')) : null;
+    },
+    async saveRewards(rewards) {
+      fs.writeFileSync(REWARDS_FILE, JSON.stringify(rewards, null, 2));
+    },
+    async getDbInfo() {
+      const users = await this.listUsers();
+      const files = fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR).sort() : [];
+      return {
+        storageDriver: 'file',
+        generatedAt: new Date().toISOString(),
+        connection: {
+          mode: 'local files',
+          dataDir: DATA_DIR,
+        },
+        summary: {
+          userCount: users.length,
+          dataFiles: files.length,
+        },
+        tables: [
+          { name: 'users/*.json', rowCount: users.length, engine: 'filesystem', comment: 'User archives' },
+          { name: 'codes.json', rowCount: fs.existsSync(CODES_FILE) ? 1 : 0, engine: 'filesystem', comment: 'Redeem codes' },
+          { name: 'rewards.json', rowCount: fs.existsSync(REWARDS_FILE) ? 1 : 0, engine: 'filesystem', comment: 'Rank rewards' },
+        ],
+        columns: [],
+        indexes: [],
+      };
+    },
+  };
+}
+
+function createMysqlStore() {
+  let pool = null;
+  let initPromise = null;
+
+  async function init() {
+    if (initPromise) return initPromise;
+    initPromise = (async () => {
+      if (!process.env.MYSQL_URL) throw new Error('MYSQL_URL is required when STORAGE_DRIVER=mysql');
+      const mysql = require('mysql2/promise');
+      pool = mysql.createPool({
+        uri: process.env.MYSQL_URL,
+        waitForConnections: true,
+        connectionLimit: Number(process.env.MYSQL_POOL_LIMIT || 10),
+      });
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS fish_users (
+          username VARCHAR(32) PRIMARY KEY,
+          data LONGTEXT NOT NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS fish_kv (
+          name VARCHAR(64) PRIMARY KEY,
+          data LONGTEXT NOT NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+    })();
+    return initPromise;
+  }
+
+  async function getKv(name) {
+    await init();
+    const [rows] = await pool.execute('SELECT data FROM fish_kv WHERE name = ?', [name]);
+    return rows[0] ? parseStoredJson(rows[0].data) : null;
+  }
+
+  async function setKv(name, value) {
+    await init();
+    await pool.execute(
+      'INSERT INTO fish_kv (name, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)',
+      [name, JSON.stringify(value)]
+    );
+  }
+
+  async function getDbInfo() {
+    await init();
+    const [[versionRow]] = await pool.query('SELECT VERSION() AS version, DATABASE() AS databaseName, CURRENT_USER() AS currentUser');
+    const databaseName = versionRow.databaseName;
+    const [tableRows] = await pool.execute(
+      `SELECT TABLE_NAME AS name,
+              ENGINE AS engine,
+              TABLE_ROWS AS estimatedRows,
+              DATA_LENGTH AS dataLength,
+              INDEX_LENGTH AS indexLength,
+              CREATE_TIME AS createTime,
+              UPDATE_TIME AS updateTime,
+              TABLE_COMMENT AS comment
+         FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = ?
+        ORDER BY TABLE_NAME`,
+      [databaseName]
+    );
+    const [columnRows] = await pool.execute(
+      `SELECT TABLE_NAME AS tableName,
+              COLUMN_NAME AS name,
+              COLUMN_TYPE AS type,
+              IS_NULLABLE AS nullable,
+              COLUMN_KEY AS columnKey,
+              COLUMN_DEFAULT AS defaultValue,
+              EXTRA AS extra,
+              COLUMN_COMMENT AS comment
+         FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = ?
+        ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+      [databaseName]
+    );
+    const [indexRows] = await pool.execute(
+      `SELECT TABLE_NAME AS tableName,
+              INDEX_NAME AS name,
+              NON_UNIQUE AS nonUnique,
+              GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ') AS columns
+         FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = ?
+        GROUP BY TABLE_NAME, INDEX_NAME, NON_UNIQUE
+        ORDER BY TABLE_NAME, INDEX_NAME`,
+      [databaseName]
+    );
+
+    const tables = [];
+    for (const table of tableRows) {
+      let rowCount = null;
+      try {
+        const [[countRow]] = await pool.query(`SELECT COUNT(*) AS rowCount FROM ${quoteIdentifier(table.name)}`);
+        rowCount = Number(countRow.rowCount);
+      } catch (_) {}
+      tables.push({
+        ...table,
+        rowCount,
+        dataLength: Number(table.dataLength || 0),
+        indexLength: Number(table.indexLength || 0),
+      });
+    }
+
+    return {
+      storageDriver: 'mysql',
+      generatedAt: new Date().toISOString(),
+      connection: {
+        uri: maskConnectionUri(process.env.MYSQL_URL),
+        database: databaseName,
+        currentUser: versionRow.currentUser,
+        version: versionRow.version,
+        poolLimit: Number(process.env.MYSQL_POOL_LIMIT || 10),
+      },
+      summary: {
+        tableCount: tables.length,
+        totalRows: tables.reduce((sum, table) => sum + (table.rowCount || 0), 0),
+        totalBytes: tables.reduce((sum, table) => sum + (table.dataLength || 0) + (table.indexLength || 0), 0),
+      },
+      tables,
+      columns: columnRows,
+      indexes: indexRows.map((index) => ({ ...index, unique: Number(index.nonUnique) === 0 })),
+    };
+  }
+
+  return {
+    init,
+    async getUser(name) {
+      await init();
+      const [rows] = await pool.execute('SELECT data FROM fish_users WHERE username = ?', [name]);
+      return rows[0] ? parseStoredJson(rows[0].data) : null;
+    },
+    async saveUser(user) {
+      await init();
+      await pool.execute(
+        'INSERT INTO fish_users (username, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)',
+        [user.username, JSON.stringify(user)]
+      );
+    },
+    async listUsers() {
+      await init();
+      const [rows] = await pool.execute('SELECT data FROM fish_users');
+      return rows.flatMap((row) => {
+        try {
+          return [parseStoredJson(row.data)];
+        } catch (_) {
+          return [];
+        }
+      });
+    },
+    getCodes: () => getKv('codes'),
+    saveCodes: (codes) => setKv('codes', codes),
+    getRewards: () => getKv('rewards'),
+    saveRewards: (rewards) => setKv('rewards', rewards),
+    getDbInfo,
+  };
+}
+
+function createStore() {
+  if (STORAGE_DRIVER === 'mysql') return createMysqlStore();
+  return createFileStore();
+}
+
+const store = createStore();
+
+async function loadCodes() {
+  await store.init();
+  let codes = (await store.getCodes()) || {};
   let updated = false;
   for (const [key, val] of Object.entries(DEFAULT_CODES)) {
-    if (!codes[key]) { codes[key] = val; updated = true; }
+    if (!codes[key]) { codes[key] = cloneJson(val); updated = true; }
   }
-  if (updated) fs.writeFileSync(CODES_FILE, JSON.stringify(codes, null, 2));
+  if (updated) await store.saveCodes(codes);
   return codes;
 }
 
-function saveCodes(codes) {
-  fs.writeFileSync(CODES_FILE, JSON.stringify(codes, null, 2));
+async function saveCodes(codes) {
+  await store.init();
+  await store.saveCodes(codes);
 }
 
 const MIME = {
@@ -160,14 +412,14 @@ function defaultUser(name) {
   };
 }
 
-function loadUser(name) {
-  const p = userPath(name);
-  if (!fs.existsSync(p)) {
+async function loadUser(name) {
+  await store.init();
+  const existing = await store.getUser(name);
+  if (!existing) {
     const u = defaultUser(name);
-    fs.writeFileSync(p, JSON.stringify(u, null, 2));
+    await store.saveUser(u);
     return u;
   }
-  const existing = JSON.parse(fs.readFileSync(p, 'utf8'));
   const defaults = defaultUser(name);
   return {
     ...defaults,
@@ -191,8 +443,9 @@ function loadUser(name) {
   };
 }
 
-function saveUser(user) {
-  fs.writeFileSync(userPath(user.username), JSON.stringify(user, null, 2));
+async function saveUser(user) {
+  await store.init();
+  await store.saveUser(user);
 }
 
 function readBody(req) {
@@ -272,6 +525,14 @@ function clientHasFreshCopy(req, headers) {
 }
 
 function serveStatic(req, res) {
+  return serveStaticFrom(req, res, PUBLIC, '');
+}
+
+function serveOpsStatic(req, res) {
+  return serveStaticFrom(req, res, OPS_PUBLIC, '/ops');
+}
+
+function serveStaticFrom(req, res, rootDir, mountPath) {
   const parsed = new URL(req.url, 'http://localhost');
   let p;
   try {
@@ -280,9 +541,11 @@ function serveStatic(req, res) {
     res.writeHead(400);
     return res.end('Bad request');
   }
+  if (mountPath && (p === mountPath || p === mountPath + '/')) p = mountPath + '/index.html';
+  if (mountPath && p.startsWith(mountPath + '/')) p = p.slice(mountPath.length);
   if (p === '/') p = '/index.html';
-  const file = path.resolve(PUBLIC, '.' + p);
-  const rel = path.relative(PUBLIC, file);
+  const file = path.resolve(rootDir, '.' + p);
+  const rel = path.relative(rootDir, file);
   if (rel.startsWith('..') || path.isAbsolute(rel)) { res.writeHead(403); return res.end(); }
   fs.stat(file, (statErr, stat) => {
     if (statErr || !stat.isFile()) { res.writeHead(404); return res.end('Not found'); }
@@ -302,13 +565,21 @@ function serveStatic(req, res) {
   });
 }
 
-function getLeaderboard() {
+function isOpsAuthorized(req) {
+  const token = process.env.OPS_ADMIN_TOKEN;
+  if (!token) return true;
+  const auth = req.headers.authorization || '';
+  if (auth === `Bearer ${token}`) return true;
+  const parsed = new URL(req.url, 'http://localhost');
+  return parsed.searchParams.get('token') === token;
+}
+
+async function getLeaderboard() {
   const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
-  const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
   const entries = [];
-  for (const f of files) {
+  const users = await store.listUsers();
+  for (const u of users) {
     try {
-      const u = JSON.parse(fs.readFileSync(path.join(USERS_DIR, f), 'utf8'));
       const daily = (u.dailyStats && u.dailyStats.date === today) ? u.dailyStats : { catches: 0, weight: 0 };
       entries.push({
         username: u.username,
@@ -336,11 +607,16 @@ function createServer() {
 
   if (req.url.startsWith('/api/')) {
     try {
+      if (req.url.startsWith('/api/admin/db-info')) {
+        if (!isOpsAuthorized(req)) return json(res, 401, { error: 'unauthorized' });
+        await store.init();
+        return json(res, 200, await store.getDbInfo());
+      }
       if (req.url === '/api/leaderboard') {
-        return json(res, 200, getLeaderboard());
+        return json(res, 200, await getLeaderboard());
       }
       if (req.url === '/api/rank-history') {
-        const rewards = loadRewards();
+        const rewards = await loadRewards();
         return json(res, 200, { history: rewards.history || [] });
       }
 
@@ -349,17 +625,17 @@ function createServer() {
       if (!name) return json(res, 400, { error: '用户名无效' });
 
       if (req.url === '/api/login') {
-        const user = loadUser(name);
+        const user = await loadUser(name);
         const unseen = (user.rankRewards || []).filter(r => !r.seen);
         if (unseen.length > 0) {
           unseen.forEach(r => r.seen = true);
-          saveUser(user);
+          await saveUser(user);
         }
         return json(res, 200, { ...user, pendingRankRewards: unseen });
       }
       if (req.url === '/api/save') {
         // 客户端发送整个 user state，做最小校验
-        const existing = loadUser(name);
+        const existing = await loadUser(name);
         const incoming = body.state || {};
         // 服务器是权威——但简化：信任客户端，仅做基本字段保护
         const merged = {
@@ -384,7 +660,7 @@ function createServer() {
           accessories: Array.isArray(incoming.accessories) ? incoming.accessories : (existing.accessories || []),
           equippedAccessory: incoming.equippedAccessory ?? existing.equippedAccessory ?? null,
         };
-        saveUser(merged);
+        await saveUser(merged);
         return json(res, 200, merged);
       }
       if (req.url === '/api/gacha') {
@@ -394,7 +670,7 @@ function createServer() {
         const cost = currency === 'diamonds'
           ? (count === 1 ? 10 : 90)
           : (season === 2 ? (count === 1 ? 10000 : 100000) : (count === 1 ? 1000 : 9000));
-        const u = loadUser(name);
+        const u = await loadUser(name);
         u.diamonds = Math.max(0, Math.floor(u.diamonds || 0));
         if (currency === 'diamonds') {
           if (u.diamonds < cost) return json(res, 400, { error: '钻石不足' });
@@ -492,22 +768,22 @@ function createServer() {
             u.money += 1;
           }
         }
-        saveUser(u);
+        await saveUser(u);
         return json(res, 200, { results, user: u });
       }
       if (req.url === '/api/redeem') {
         const code = String(body.code || '').trim().toUpperCase();
         if (!code) return json(res, 400, { error: '请输入兑换码' });
-        const codes = loadCodes();
+        const codes = await loadCodes();
         const entry = codes[code];
         if (!entry) return json(res, 400, { error: '兑换码不存在' });
         if (entry.usedBy.includes(name)) return json(res, 400, { error: '你已经使用过这个兑换码了' });
         entry.usedBy.push(name);
-        saveCodes(codes);
-        const u = loadUser(name);
+        await saveCodes(codes);
+        const u = await loadUser(name);
         if (entry.coins) u.money = (u.money || 0) + entry.coins;
         if (entry.diamonds) u.diamonds = (u.diamonds || 0) + entry.diamonds;
-        saveUser(u);
+        await saveUser(u);
         return json(res, 200, { success: true, coins: entry.coins || 0, diamonds: entry.diamonds || 0, desc: entry.desc, user: u });
       }
       return json(res, 404, { error: 'unknown api' });
@@ -515,17 +791,28 @@ function createServer() {
       return json(res, 500, { error: e.message });
     }
   }
+  if (req.url === '/ops' || req.url.startsWith('/ops/')) {
+    return serveOpsStatic(req, res);
+  }
   serveStatic(req, res);
 });
 }
 
 if (require.main === module) {
-  const server = createServer();
-  server.listen(PORT, () => {
-    console.log(`Fishing game backend running at http://localhost:${PORT}`);
-    settleRankRewardIfDue();
-    scheduleSettlement();
-  });
+  store.init()
+    .then(() => {
+      const server = createServer();
+      server.listen(PORT, () => {
+        console.log(`Fishing game backend running at http://localhost:${PORT}`);
+        console.log(`Storage driver: ${STORAGE_DRIVER}`);
+        settleRankRewardIfDue().catch((e) => console.error('[排名奖励] 检查失败:', e));
+        scheduleSettlement();
+      });
+    })
+    .catch((e) => {
+      console.error('Failed to initialize storage:', e);
+      process.exit(1);
+    });
 }
 
 module.exports = {

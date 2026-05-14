@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fish Ops</title>
+  <link rel="stylesheet" href="/ops/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Fish Backend</p>
+      <h1>运维平台</h1>
+    </div>
+    <form id="tokenForm" class="token-form">
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="OPS_ADMIN_TOKEN">
+      <button type="submit">刷新</button>
+    </form>
+  </header>
+
+  <main>
+    <section class="status-line" id="statusLine">正在读取数据库信息...</section>
+
+    <section class="metrics" id="metrics"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>连接信息</h2>
+      </div>
+      <dl class="details" id="connectionDetails"></dl>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>数据表</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>表名</th>
+              <th>行数</th>
+              <th>引擎</th>
+              <th>数据</th>
+              <th>索引</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody id="tablesBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="split">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>字段</h2>
+        </div>
+        <div id="columnsList" class="list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>索引</h2>
+        </div>
+        <div id="indexesList" class="list"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/ops/app.js"></script>
+</body>
+</html>
